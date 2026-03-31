@@ -1,0 +1,14 @@
+target-version = "py310"
+line-length = 88
+
+exclude = [
+  "reports",
+]
+
+[lint]
+select = [
+  "E9",   # syntax and parser-level errors
+  "F63",  # invalid %-format usage
+  "F7",   # undefined/invalid names in control flow
+  "F82",  # undefined names in annotations
+]

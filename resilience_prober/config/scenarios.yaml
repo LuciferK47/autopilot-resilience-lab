@@ -1,0 +1,293 @@
+# ArduPilot SITL Resilience Prober - Scenario Definitions
+# Each scenario defines waypoints, fault injection, and pass/fail criteria.
+
+# Default SITL home location (Canberra, Australia)
+defaults:
+  home: "-35.363261,149.165230,584,353"
+  vehicle: ArduCopter
+  altitude: 20
+  speedup: 3
+  timeout_s: 180
+  waypoints: &default_waypoints
+    - {lat: -35.3627, lon: 149.1652, alt: 20}
+    - {lat: -35.3620, lon: 149.1652, alt: 20}
+    - {lat: -35.3620, lon: 149.1662, alt: 20}
+    - {lat: -35.3627, lon: 149.1662, alt: 20}
+
+scenarios:
+  # ─────────────────────────────────────────────
+  # 1. NOMINAL FLIGHT — Baseline, no faults
+  # ─────────────────────────────────────────────
+  - name: "Nominal Waypoint Mission"
+    id: nominal
+    vehicle: ArduCopter
+    description: >
+      Baseline 4-waypoint square mission with RTL.
+      No faults injected. Establishes normal flight metrics
+      for comparison with fault scenarios.
+    altitude: 20
+    speedup: 5
+    timeout_s: 180
+    waypoints: *default_waypoints
+    failsafe_params: {}
+    faults: []
+    pass_criteria:
+      must_complete_mission: true
+      max_position_drift_m: 5.0
+      min_health_score: 0.7
+
+  # ─────────────────────────────────────────────
+  # 2. GPS DENIAL — Disable GPS mid-flight
+  # ─────────────────────────────────────────────
+  - name: "GPS Denial"
+    id: gps_denial
+    vehicle: ArduCopter
+    description: >
+      Disables GPS mid-flight by setting SIM_GPS1_ENABLE=0.
+      Verifies the EKF detects GPS loss and triggers
+      appropriate failsafe (LAND or ALT_HOLD).
+    altitude: 20
+    speedup: 5
+    timeout_s: 180
+    waypoints: *default_waypoints
+    failsafe_params:
+      FS_EKF_ACTION: 1       # Land on EKF failsafe
+      FS_EKF_THRESH: 0.8     # Default threshold
+    faults:
+      - trigger:
+          type: time
+          after_s: 30
+        params:
+          SIM_GPS1_ENABLE: 0
+        description: "GPS disabled"
+    pass_criteria:
+      required_failsafe:
+        - "LAND"
+        - "ALT_HOLD"
+      max_position_drift_m: 15.0
+      must_detect_failsafe: true
+      max_recovery_time_s: 30.0
+
+  # ─────────────────────────────────────────────
+  # 3. MOTOR FAILURE — Kill one motor
+  # ─────────────────────────────────────────────
+  - name: "Motor Failure"
+    id: motor_failure
+    vehicle: ArduCopter
+    description: >
+      Simulates failure of motor 1 via SIM_ENGINE_FAIL bitmask.
+      On a quad, this will likely trigger crash detection
+      and force LAND. Tests the crash check system.
+    altitude: 20
+    speedup: 5
+    timeout_s: 180
+    waypoints: *default_waypoints
+    failsafe_params:
+      FS_CRASH_CHECK: 1      # Enable crash detection
+    faults:
+      - trigger:
+          type: time
+          after_s: 30
+        params:
+          SIM_ENGINE_FAIL: 1    # Bitmask: motor 1
+          SIM_ENGINE_MUL: 0.0   # Complete failure
+        description: "Motor 1 failed"
+    pass_criteria:
+      required_failsafe:
+        - "LAND"
+      must_detect_failsafe: true
+      max_altitude_at_end_m: 2.0
+
+  # ─────────────────────────────────────────────
+  # 4. BATTERY FAILSAFE — Drain battery voltage
+  # ─────────────────────────────────────────────
+  - name: "Battery Failsafe"
+    id: battery_failsafe
+    vehicle: ArduCopter
+    description: >
+      Drops battery voltage to 10.5V mid-flight to trigger
+      low-battery failsafe. Verifies RTL or LAND is triggered
+      based on BATT_FS_LOW_ACT configuration.
+    altitude: 20
+    speedup: 5
+    timeout_s: 180
+    waypoints: *default_waypoints
+    failsafe_params:
+      BATT_FS_LOW_ACT: 2     # RTL on low battery
+      BATT_LOW_VOLT: 10.5    # Low voltage threshold
+      BATT_CRT_VOLT: 10.0    # Critical voltage threshold
+      BATT_FS_CRT_ACT: 1     # Land on critical battery
+    faults:
+      - trigger:
+          type: time
+          after_s: 30
+        params:
+          SIM_BATT_VOLTAGE: 10.3
+        description: "Battery voltage dropped to 10.3V"
+    pass_criteria:
+      required_failsafe:
+        - "RTL"
+        - "LAND"
+        - "SMART_RTL"
+      must_detect_failsafe: true
+
+  # ─────────────────────────────────────────────
+  # 5. WIND SHEAR — Strong crosswind injection
+  # ─────────────────────────────────────────────
+  - name: "Wind Shear"
+    id: wind_shear
+    vehicle: ArduCopter
+    description: >
+      Injects strong crosswind (15 m/s with 5 m/s turbulence)
+      mid-flight. Tests the position controller's ability to
+      hold course under wind disturbance.
+    altitude: 20
+    speedup: 5
+    timeout_s: 180
+    waypoints: *default_waypoints
+    failsafe_params: {}
+    faults:
+      - trigger:
+          type: time
+          after_s: 25
+        params:
+          SIM_WIND_SPD: 15      # 15 m/s sustained wind
+          SIM_WIND_DIR: 90      # From east
+          SIM_WIND_TURB: 5      # 5 m/s turbulence
+        description: "Strong crosswind from east"
+    pass_criteria:
+      max_position_drift_m: 20.0
+      min_health_score: 0.3
+
+  # ─────────────────────────────────────────────
+  # 6. PHYSICAL SHOVE — External force impact
+  # ─────────────────────────────────────────────
+  - name: "Physical Shove"
+    id: physical_shove
+    vehicle: ArduCopter
+    description: >
+      Applies a sudden external force (50 m/s² for 500ms)
+      mid-flight using SIM_SHOVE parameters. Tests the attitude
+      controller's recovery from an unexpected impulse — like
+      a bird strike or rotor wash from another aircraft.
+    altitude: 20
+    speedup: 5
+    timeout_s: 180
+    waypoints: *default_waypoints
+    failsafe_params: {}
+    faults:
+      - trigger:
+          type: time
+          after_s: 25
+        params:
+          SIM_SHOVE_X: 50       # 50 m/s² in X
+          SIM_SHOVE_Y: 30       # 30 m/s² in Y
+          SIM_SHOVE_TIME: 500   # 500ms duration
+        description: "Physical shove applied"
+    pass_criteria:
+      max_position_drift_m: 15.0
+      min_health_score: 0.2
+      must_complete_mission: false
+
+  # ─────────────────────────────────────────────
+  # 7. COMPASS FAILURE — Primary compass failure
+  # ─────────────────────────────────────────────
+  - name: "Compass Failure"
+    id: compass_failure
+    vehicle: ArduCopter
+    description: >
+      Fails the primary compass (SIM_MAG1_FAIL=1) mid-flight.
+      Tests EKF compass failover from compass 1 to compass 2.
+      Verifies the vehicle maintains heading estimate and
+      continues mission or enters safe failsafe mode.
+    altitude: 20
+    speedup: 5
+    timeout_s: 180
+    waypoints: *default_waypoints
+    failsafe_params:
+      FS_EKF_ACTION: 1         # Land on EKF failsafe
+      FS_EKF_THRESH: 0.8       # Default threshold
+    faults:
+      - trigger:
+          type: time
+          after_s: 30
+        params:
+          SIM_MAG1_FAIL: 1
+        description: "Primary compass failed"
+    pass_criteria:
+      min_health_score: 0.2
+      max_position_drift_m: 15.0
+  # ─────────────────────────────────────────────
+  # 8. CASCADING GPS + WIND — Compound failure
+  # ─────────────────────────────────────────────
+  - name: "Cascading GPS + Wind"
+    id: cascading_gps_wind
+    vehicle: ArduCopter
+    description: >
+      Compound failure: strong crosswind at T+20s degrades
+      position hold, then GPS denial at T+35s removes the
+      primary position source. Tests whether the EKF can
+      cope with cascading degradation — realistic in a
+      storm scenario where GPS multipath worsens before
+      total signal loss.
+    altitude: 20
+    speedup: 5
+    timeout_s: 180
+    waypoints: *default_waypoints
+    failsafe_params:
+      FS_EKF_ACTION: 1
+      FS_EKF_THRESH: 0.8
+    faults:
+      - trigger:
+          type: time
+          after_s: 20
+        params:
+          SIM_WIND_SPD: 12
+          SIM_WIND_DIR: 45
+          SIM_WIND_TURB: 4
+        description: "Strong wind from NE"
+      - trigger:
+          type: time
+          after_s: 35
+        params:
+          SIM_GPS1_ENABLE: 0
+        description: "GPS denied (compound with wind)"
+    pass_criteria:
+      must_detect_failsafe: true
+      required_failsafe:
+        - "LAND"
+        - "ALT_HOLD"
+      max_position_drift_m: 25.0
+
+  # ─────────────────────────────────────────────
+  # 9. TWIST DISTURBANCE — Rotational impact
+  # ─────────────────────────────────────────────
+  - name: "Rotational Twist"
+    id: twist_disturbance
+    vehicle: ArduCopter
+    description: >
+      Applies angular acceleration via SIM_TWIST to simulate
+      a rotational disturbance — e.g. torque from a snagged
+      cable, asymmetric ice build-up, or a seized bearing.
+      Tests the attitude controller's ability to reject
+      sudden yaw/roll torques. Nobody else tests this
+      parameter in automated fault injection.
+    altitude: 20
+    speedup: 5
+    timeout_s: 180
+    waypoints: *default_waypoints
+    failsafe_params: {}
+    faults:
+      - trigger:
+          type: time
+          after_s: 25
+        params:
+          SIM_TWIST_X: 20.0
+          SIM_TWIST_Y: 15.0
+          SIM_TWIST_Z: 10.0
+          SIM_TWIST_TIME: 800
+        description: "Rotational twist applied"
+    pass_criteria:
+      max_position_drift_m: 20.0
+      min_health_score: 0.15
+      must_complete_mission: false
