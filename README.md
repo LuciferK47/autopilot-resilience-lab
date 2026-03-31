@@ -1,4 +1,4 @@
-# Autopilot Resilience Lab
+# Ardupilot Resilience Lab
 
 Fault-injection and resilience analysis toolkit for ArduPilot SITL.
 
