@@ -3,6 +3,36 @@
 ## Project Overview
 A research-grade, automated diagnostic framework that evaluates the resilience of ArduPilot systems. It transitions away from arbitrary time-based testing into a highly deterministic, mathematically rigorous diagnostic pipeline. The framework launches SITL, injects environmental entropy, flies targeted waypoint missions, triggers spatial faults, and extracts deep EKF telemetry for Machine Learning pipelines.
 
+### End-to-End Execution Flow
+```mermaid
+graph TD
+    A[test_end_to_end.py] -->|1. Loads Config| B(config/scenarios.yaml)
+    A -->|2. Launches| C[SITL Instance]
+    A -->|3. Connects via MAVLink| D(vehicle_controller.py)
+    
+    D -->|Wait for EKF & GPS| E{Is Drone Ready?}
+    E -->|Yes| F[Inject Environmental Noise]
+    F --> G[Upload Mission & Arm]
+    
+    G --> H(fault_injector.py)
+    H -->|Poll VFR_HUD| I{Kinematic Trigger Met?}
+    I -->|Yes| J[Sync SYSTEM_TIME & Inject Fault]
+    
+    J --> K[Wait for Crash/Failsafe]
+    K --> L[Universal I/O Cooldown]
+    L --> M[Zombie Slayer]
+    
+    M --> N(log_analyzer.py)
+    N -->|Parse DataFlash| O[Extract XKF1/3/4 & RCOU]
+    
+    O --> P(resilience_calculator.py)
+    P -->|Calculate Metrics| Q[Resilience Index]
+    
+    Q --> R(report_generator.py)
+    R --> S[(Parquet DataFrame)]
+    R --> T[HTML Radar Report]
+```
+
 ## The 5 Architectural Pillars
 
 ### 1. Environmental Determinism
