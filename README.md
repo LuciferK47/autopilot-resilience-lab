@@ -1,208 +1,91 @@
-# Ardupilot Resilience Lab
+# ArduPilot Resilience Lab: Automated Probing Architecture
 
-Fault-injection and resilience analysis toolkit for ArduPilot SITL.
+## Project Overview
+A research-grade, automated diagnostic framework that evaluates the resilience of ArduPilot systems. It transitions away from arbitrary time-based testing into a highly deterministic, mathematically rigorous diagnostic pipeline. The framework launches SITL, injects environmental entropy, flies targeted waypoint missions, triggers spatial faults, and extracts deep EKF telemetry for Machine Learning pipelines.
 
-This repository helps you run repeatable fault scenarios (GPS loss, motor failure, battery failsafe, wind disturbances, cascading faults, and more), analyze recovery behavior, and generate a rich HTML report with mission metrics and EKF forensics.
+## The 5 Architectural Pillars
 
-## Why This Repository
+### 1. Environmental Determinism
+- Injects baseline entropy (`SIM_WIND`, `SIM_BARO_NOISE`, `SIM_GPS_NOISE`) directly into the SITL EEPROM via MAVLink (`param_set_send`) before arming.
+- Forces the EKF to actively filter realistic environmental noise, preventing the drone from flying in a mathematically "perfect" vacuum.
+- Enforces `LOG_DISARMED=1` and `LOG_BITMASK=131071` to guarantee absolute maximum DataFlash telemetry from the millisecond the vehicle boots.
 
-- Runs realistic mission-based tests in ArduPilot SITL.
-- Injects single and multi-stage faults at deterministic times.
-- Scores behavior with a quantitative resilience index.
-- Produces report artifacts suitable for research and regression tracking.
-- Keeps the repository lightweight by not tracking the full ArduPilot source tree.
+### 2. Kinematic Spatial Fault Triggers
+- Abandons blind, rigid `time.sleep()` fault triggers.
+- Implements a state-based kinematic envelope trigger (`wait_for_kinematic_trigger`) that actively polls `VFR_HUD` and `NAV_CONTROLLER_OUTPUT`.
+- Faults are only injected when specific physical conditions are met (e.g., Altitude > 15m, Groundspeed > 5m/s, Distance to Waypoint < 15m), ensuring exactly reproducible crash geometries regardless of wind conditions.
+- Syncs the precise `SYSTEM_TIME` epoch before injecting faults (like GPS Denial) for perfect log alignment.
 
-## Repository Structure
+### 3. Baseline Delta Architecture
+- The orchestrator (`test_end_to_end.py`) systematically executes a **Nominal** flight first to establish a mathematical baseline performance envelope.
+- It then executes targeted fault scenarios (e.g., `gps_denial_basic`).
+- Generates a **Delta Scorecard**, strictly quantifying the fault's deviation against the established nominal baseline (Peak Error, Control Saturation, and the unified Resilience Index).
 
-```
+### 4. Artifact Duality
+- Replaces monolithic terminal outputs with dual-purpose data persistence.
+- **Machine-Readable**: Exports fully synchronized, post-fault Pandas DataFrames to highly compressed `.parquet` files for seamless downstream Machine Learning integration.
+- **Human-Readable**: Generates rich, interactive `.html` reports with Matplotlib time-series and comparative radar charts.
+
+### 5. Universal I/O Cooldown & Zombie Slaying
+- Implements a strict `time.sleep(5.0)` buffer following any disarm or flight completion event, ensuring the virtual EEPROM flushes all high-frequency EKF crash telemetry to the DataFlash `.BIN` file (preventing empty logs).
+- Executes aggressive OS-level purges (`killall -9 arducopter sim_vehicle.py mavproxy.py`) between test runs to obliterate orphaned C++ physics engines and cleanly release TCP port 5760.
+
+## Core Pipeline Architecture
+
+```text
 autopilot-resilience-lab/
-├── setup_ardupilot.sh              # Clones ArduPilot locally (not tracked as submodule)
-├── ardupilot/                      # Local clone location (ignored by git)
-├── custom_tools/
-│   ├── ekf_comparator.py
-│   ├── log_reader.py
-│   └── sysid_sweeper.py
+├── custom_tools/                  # External analysis helpers
+├── setup_ardupilot.sh             # ArduPilot SITL installer script
 └── resilience_prober/
-    ├── resilience_prober.py        # Main CLI entry point
-    ├── config/scenarios.yaml       # Scenario catalog and pass criteria
-    ├── core/                       # SITL launch, control, injection, analysis, reporting
-    ├── scenarios/                  # Runner and validation
-    ├── tests/                      # Unit tests
-    └── reports/                    # Generated reports
+    ├── test_end_to_end.py             # Primary Orchestrator (Nominal -> Fault -> Delta)
+    ├── config/
+    │   └── scenarios.yaml             # Kinematic Triggers & Determinism Parameters
+    ├── core/
+    │   ├── vehicle_controller.py      # EKF/GPS Readiness Barriers & Mode Control
+    │   ├── fault_injector.py          # Spatial Envelope Polling & Epoch Synchronization
+    │   ├── log_analyzer.py            # High-Performance DataFlash (XKF1, XKF3, XKF4) Parser
+    │   ├── resilience_calculator.py   # Mathematical Resilience Index Computation
+    │   └── report_generator.py        # Artifact Duality (Parquet + HTML Exports)
+    └── reports/                       # Generated Parquet and HTML Artifacts
 ```
 
-## Prerequisites
-
-- Linux environment (recommended for SITL and automation).
-- Git.
-- Python 3.10+.
-- Build/runtime packages required by ArduPilot SITL.
-
-If this is a fresh machine, install ArduPilot build dependencies first using official ArduPilot docs for your distro.
+## The EKF Forensics Engine
+The pipeline bypasses standard low-frequency MAVLink telemetry and rips data directly from ArduPilot's internal C++ logging structures (`.BIN` files) using a filtered `recv_match` while-loop to avoid memory exhaustion:
+- **XKF1**: Physical drift state (`PN`, `PE`, `PD` in meters)
+- **XKF3**: Raw innovations (`IPN`, `IPE` - internal EKF positional drift metrics)
+- **XKF4**: Normalized test ratios (Sensor rejection tracking)
+- **RCOU**: High-frequency motor output saturation tracking (`C1`-`C4`)
 
 ## Quick Start
 
-1. Clone this repository.
+### Prerequisites
+- **ArduPilot SITL built** (arducopter binary in `build/sitl/bin/`)
+- **Python 3.10+**
 
+### Setup
 ```bash
 git clone https://github.com/LuciferK47/autopilot-resilience-lab.git
 cd autopilot-resilience-lab
-```
 
-2. Download ArduPilot source locally (outside git tracking for this repo).
-
-```bash
+# Download ArduPilot source locally (outside git tracking)
 chmod +x setup_ardupilot.sh
 ./setup_ardupilot.sh
-```
 
-3. Install Python dependencies for the prober.
-
-```bash
+# Install Python dependencies
 cd resilience_prober
-python3 -m pip install -r requirements.txt
-python3 -m pip install -r requirements-dev.txt
+pip install -r requirements.txt
+
+# Ensure PyArrow is installed for the data science engine
+python3 -m pip install pyarrow pandas
 ```
 
-4. Check available scenarios.
-
-```bash
-python resilience_prober.py --list
-```
-
-5. Run a smoke test.
-
-```bash
-python resilience_prober.py --smoke
-```
-
-6. Run full campaign.
-
-```bash
-python resilience_prober.py --all --clean-logs
-```
-
-## Workflow Design
-
-### End-to-End Execution Flow
-
-```mermaid
-flowchart TD
-    A[Clone this repository] --> B[Run setup_ardupilot.sh]
-    B --> C[Local ardupilot directory ready]
-    C --> D[Install resilience_prober dependencies]
-    D --> E[Choose run mode]
-    E --> F[Single scenario]
-    E --> G[All scenarios]
-    E --> H[Smoke test]
-    F --> I[Launch SITL + arm + mission]
-    G --> I
-    H --> I
-    I --> J[Inject configured faults]
-    J --> K[Live health monitoring]
-    K --> L[Collect DataFlash + MAVLink metrics]
-    L --> M[Recovery + EKF analysis]
-    M --> N[Generate HTML report]
-    N --> O[Review resilience outcomes]
-```
-
-### Internal Pipeline Design
-
-```mermaid
-flowchart LR
-    A[resilience_prober.py CLI] --> B[scenario_runner]
-    B --> C[sitl_launcher]
-    B --> D[vehicle_controller]
-    B --> E[fault_injector]
-    B --> F[health_monitor]
-    B --> G[log_analyzer]
-    G --> H[ekf_forensics]
-    G --> I[recovery_analyzer]
-    H --> J[report_generator]
-    I --> J
-    F --> J
-    J --> K[reports/resilience_report_*.html]
-```
-
-## Main Commands
-
-From the resilience_prober directory:
-
-```bash
-# List all configured scenarios
-python resilience_prober.py --list
-
-# Run one scenario
-python resilience_prober.py --scenario gps_denial
-
-# Run all scenarios
-python resilience_prober.py --all
-
-# Use custom ArduPilot path
-python resilience_prober.py --all --ardupilot-path ../ardupilot
-
-# Skip report generation
-python resilience_prober.py --scenario nominal --no-report
-```
-
-## Development Workflow
-
+### Execution
 ```bash
 cd resilience_prober
 
-# Lint
-make lint
+# 1. Clean up any stuck SITL instances
+ps aux | grep -E "sim_vehicle\.py|arducopter|mavproxy" | grep -v grep | awk '{print $2}' | xargs -r kill -9
 
-# Tests
-make test
-
-# SITL smoke
-make smoke
+# 2. Run the Architected Pipeline
+python test_end_to_end.py
 ```
-
-CI workflow runs on changes under resilience_prober using:
-
-- .github/workflows/resilience_prober_ci.yml
-
-## Scenarios at a Glance
-
-Scenario definitions are in resilience_prober/config/scenarios.yaml.
-
-Current set includes:
-
-- nominal
-- gps_denial
-- motor_failure
-- battery_failsafe
-- wind_shear
-- physical_shove
-- compass_failure
-- cascading_gps_wind
-- twist_disturbance
-
-## Outputs and Artifacts
-
-- Generated reports: resilience_prober/reports/
-- SITL logs (DataFlash): ardupilot/logs/
-- Optional analysis helpers: custom_tools/
-
-## Notes on Repository Size
-
-- The ardupilot directory is intentionally excluded from git tracking.
-- Use setup_ardupilot.sh to recreate it on any machine.
-- This keeps clone/push operations fast while preserving reproducibility.
-
-## Troubleshooting
-
-- Error: sim_vehicle.py not found
-  - Confirm ardupilot was cloned in project root by setup_ardupilot.sh.
-  - Or pass --ardupilot-path explicitly.
-- SITL fails to launch
-  - Verify ArduPilot dependencies are installed and SITL build is complete.
-- No report generated
-  - Ensure you did not pass --no-report.
-  - Check write permissions in resilience_prober/reports.
-
-## License
-
-Add your preferred license file and update this section.
