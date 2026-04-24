@@ -24,6 +24,7 @@ import os
 import datetime
 from typing import Dict, List, Optional
 
+import pandas as pd
 import numpy as np
 import matplotlib
 matplotlib.use("Agg")                       # headless backend
@@ -600,3 +601,46 @@ def _ri_color(ri: float) -> str:
         return "#fb923c"    # orange
     else:
         return "#ef4444"    # red
+
+def export_artifacts(scenario_name: str, df: pd.DataFrame, metrics: dict):
+    """Exports both a human-readable HTML report and a machine-readable Parquet file."""
+    os.makedirs("reports", exist_ok=True)
+    
+    # 1. Machine Learning Pipeline Artifact
+    parquet_path = f"reports/{scenario_name}_dataframe.parquet"
+    df.to_parquet(parquet_path, engine='pyarrow')
+    print(f"Machine-readable DataFrame saved to: {parquet_path}")
+
+    # 2. Human Researcher Artifact
+    html_path = f"reports/{scenario_name}_report.html"
+    html_content = f"""
+    <html>
+        <head><title>Resilience Report: {scenario_name}</title></head>
+        <body style="font-family: Arial, sans-serif; padding: 20px;">
+            <h2>Resilience Metrics: {scenario_name}</h2>
+            <ul>
+                <li><b>Peak Error:</b> {metrics['peak_error']:.2f} m</li>
+                <li><b>Control Saturation:</b> {metrics['saturation_pct']:.2f}%</li>
+                <li><b>Resilience Index:</b> {metrics['resilience_index']:.2f}</li>
+            </ul>
+        </body>
+    </html>
+    """
+    with open(html_path, "w") as f:
+        f.write(html_content)
+    print(f"Human-readable Report saved to: {html_path}")
+
+def print_delta_scorecard(scenario_name: str, nominal_metrics: dict, fault_metrics: dict):
+    """Prints the comparative delta metrics between the fault and nominal runs."""
+    print(f"\n==================================")
+    print(f"   Delta Scorecard: {scenario_name} ")
+    print(f"==================================")
+    
+    delta_peak = fault_metrics['peak_error'] - nominal_metrics['peak_error']
+    delta_sat = fault_metrics['saturation_pct'] - nominal_metrics['saturation_pct']
+    delta_idx = fault_metrics['resilience_index'] - nominal_metrics['resilience_index']
+
+    print(f"Peak Error:         {fault_metrics['peak_error']:.2f} m ({delta_peak:+.2f} m vs Nominal)")
+    print(f"Control Saturation: {fault_metrics['saturation_pct']:.2f}% ({delta_sat:+.2f}% vs Nominal)")
+    print(f"Resilience Index:   {fault_metrics['resilience_index']:.2f} / 100 ({delta_idx:+.2f} vs Nominal)")
+    print("==================================\n")

@@ -1,214 +1,132 @@
-"""
-Log Analyzer — Post‑flight .BIN DataFlash log analysis.
+import pandas as pd
+from pymavlink import DFReader
+from pathlib import Path
 
-Extracts EKF innovations (XKF3 / NKF3), EKF variances (XKF4 / NKF4),
-attitude (ATT), position (POS), mode changes (MODE), errors (ERR),
-and events (EV) from a DataFlash .BIN file produced by SITL.
+class EKFForensics:
+    """
+    Analyzes EKF data from ArduPilot DataFlash (.BIN) logs.
+    Extracts, aligns, and merges multi-rate EKF messages into a synchronous feature matrix.
+    """
 
-Falls back gracefully if the log is too large or DFReader times out.
-"""
-
-import os
-import time
-from typing import Dict, List, Optional
-
-
-def _try_import_dfr():
-    """Import DFReader; return None on failure."""
-    try:
-        from pymavlink import mavutil
-        return mavutil
-    except ImportError:
-        return None
-
-
-class LogAnalyzer:
-    """Analyze a post‑flight .BIN log file."""
-
-    # Message types we care about
-    WANTED = {
-        "ATT":  ["TimeUS", "DesRoll", "Roll", "DesPitch", "Pitch",
-                  "DesYaw", "Yaw"],
-        "POS":  ["TimeUS", "Lat", "Lng", "Alt", "RelHomeAlt"],
-        "MODE": ["TimeUS", "Mode", "ModeNum", "Rsn"],
-        "ERR":  ["TimeUS", "Subsys", "ECode"],
-        "EV":   ["TimeUS", "Id"],
-        "BAT":  ["TimeUS", "Volt", "Curr", "CurrTot"],
-        "VIBE": ["TimeUS", "VibeX", "VibeY", "VibeZ", "Clip"],
-        # EKF3 messages (preferred)
-        "XKF3": ["TimeUS", "IVN", "IVE", "IVD", "IPN", "IPE", "IPD",
-                  "IMX", "IMY", "IMZ", "ErSc"],
-        "XKF4": ["TimeUS", "SV", "SP", "SH", "SM", "SVT", "errRP",
-                  "OFN", "OFE", "FS", "TS", "SS", "GPS", "PI"],
-        # EKF2 messages (fallback)
-        "NKF3": ["TimeUS", "IVN", "IVE", "IVD", "IPN", "IPE", "IPD",
-                  "IMX", "IMY", "IMZ"],
-        "NKF4": ["TimeUS", "SV", "SP", "SH", "SM", "SVT", "errRP",
-                  "OFN", "OFE", "FS", "TS", "SS", "GPS"],
-    }
-
-    def __init__(self, log_path: str, timeout: float = 120):
-        self.log_path = log_path
-        self.timeout = timeout
-        self.data: Dict[str, Dict[str, list]] = {}
-        self._parsed = False
-
-    def analyze(self) -> dict:
-        """Parse the log and return structured results.
-
-        Returns a dict with keys:
-            data       — {msg_type: {field: [values]}}
-            metrics    — computed quality / drift metrics
-            mode_changes — list of mode transition dicts
-            errors     — list of error dicts
-            success    — True if parse completed
+    def __init__(self, filepath: Path) -> None:
         """
-        if not os.path.exists(self.log_path):
-            print(f"[LOG] File not found: {self.log_path}")
-            return self._empty_result("file not found")
+        Initializes the EKFForensics analyzer.
+        
+        Args:
+            filepath (Path): Path to the .BIN DataFlash log file.
+        """
+        self.filepath = Path(filepath)
+        if not self.filepath.exists():
+            raise FileNotFoundError(f"DataFlash log file not found: {self.filepath}")
 
-        size_mb = os.path.getsize(self.log_path) / (1024 * 1024)
-        print(f"[LOG] Analyzing {self.log_path} ({size_mb:.1f} MB)...")
+    def extract_ekf_data(self, fault_time_us: int) -> pd.DataFrame:
+        """
+        Extracts EKF and motor output telemetry from the DataFlash log.
+        
+        Iterates the log exactly once, collecting:
+        - XKF1: Physical drift state (TimeUS, Lat, Lng, Alt)
+        - XKF3: Raw innovations (TimeUS, IVN, IVE, IVD, IPN, IPE)
+        - XKF4: Normalized test ratios (TimeUS, SV, SP, SH, SM)
+        - RCOU: Motor output saturation (TimeUS, C1, C2, C3, C4)
+        
+        Returns:
+            pd.DataFrame: A synchronous pandas DataFrame merged based on TimeUS using forward fill.
+            
+        Raises:
+            ValueError: If critical messages are missing or unable to parse the log.
+        """
+        try:
+            log = DFReader.DFReader_binary(str(self.filepath))
+        except Exception as e:
+            raise ValueError(f"Failed to read DataFlash log: {e}") from e
 
-        if size_mb > 200:
-            print("[LOG] Log too large (>200 MB) — skipping deep analysis")
-            return self._empty_result("log too large")
+        xkf1_data = []
+        xkf3_data = []
+        xkf4_data = []
+        rcou_data = []
+
+        # Iterate over the log exactly once
+        while True:
+            # We only want to parse these specific messages to save CPU cycles
+            msg = log.recv_match(type=['XKF1', 'XKF3', 'XKF4', 'RCOU'])
+            if msg is None:
+                break  # End of log file reached
+                
+            mtype = msg.get_type()
+            
+            if mtype == 'XKF1':
+                xkf1_data.append({
+                    'TimeUS': msg.TimeUS,
+                    'Roll': getattr(msg, 'Roll', None),
+                    'Pitch': getattr(msg, 'Pitch', None),
+                    'Yaw': getattr(msg, 'Yaw', None),
+                    'VN': getattr(msg, 'VN', None),
+                    'VE': getattr(msg, 'VE', None),
+                    'VD': getattr(msg, 'VD', None),
+                    'PN': getattr(msg, 'PN', None),
+                    'PE': getattr(msg, 'PE', None),
+                    'PD': getattr(msg, 'PD', None),
+                })
+            elif mtype == 'XKF3':
+                xkf3_data.append({
+                    'TimeUS': msg.TimeUS,
+                    'IVN': getattr(msg, 'IVN', None),
+                    'IVE': getattr(msg, 'IVE', None),
+                    'IVD': getattr(msg, 'IVD', None),
+                    'IPN': getattr(msg, 'IPN', None),
+                    'IPE': getattr(msg, 'IPE', None)
+                })
+            elif mtype == 'XKF4':
+                xkf4_data.append({
+                    'TimeUS': msg.TimeUS,
+                    'SV': getattr(msg, 'SV', None),
+                    'SP': getattr(msg, 'SP', None),
+                    'SH': getattr(msg, 'SH', None),
+                    'SM': getattr(msg, 'SM', None)
+                })
+            elif mtype == 'RCOU':
+                rcou_data.append({
+                    'TimeUS': msg.TimeUS,
+                    'C1': getattr(msg, 'C1', None),
+                    'C2': getattr(msg, 'C2', None),
+                    'C3': getattr(msg, 'C3', None),
+                    'C4': getattr(msg, 'C4', None)
+                })
+
+        if not xkf1_data and not xkf3_data and not xkf4_data:
+            raise ValueError("Critical EKF3 messages (XKF1, XKF3, XKF4) are missing from the log.")
+
+        def drop_duplicates_keep_last(df):
+            if df.empty: return df
+            return df.drop_duplicates(subset=['TimeUS'], keep='last')
+
+        df_xkf1 = pd.DataFrame(xkf1_data) if xkf1_data else pd.DataFrame(columns=['TimeUS', 'Roll', 'Pitch', 'Yaw', 'VN', 'VE', 'VD', 'PN', 'PE', 'PD'])
+        df_xkf3 = pd.DataFrame(xkf3_data) if xkf3_data else pd.DataFrame(columns=['TimeUS', 'IVN', 'IVE', 'IVD', 'IPN', 'IPE'])
+        df_xkf4 = pd.DataFrame(xkf4_data) if xkf4_data else pd.DataFrame(columns=['TimeUS', 'SV', 'SP', 'SH', 'SM'])
+        df_rcou = pd.DataFrame(rcou_data) if rcou_data else pd.DataFrame(columns=['TimeUS', 'C1', 'C2', 'C3', 'C4'])
+
+        df_xkf1 = drop_duplicates_keep_last(df_xkf1)
+        df_xkf3 = drop_duplicates_keep_last(df_xkf3)
+        df_xkf4 = drop_duplicates_keep_last(df_xkf4)
+        df_rcou = drop_duplicates_keep_last(df_rcou)
 
         try:
-            self._parse()
+            # Crucial Alignment Step: Sorting by TimeUS explicitly handled by concat, sort_values and ffill
+            df_merged = pd.concat([df_xkf1.set_index('TimeUS'), 
+                                   df_xkf3.set_index('TimeUS'), 
+                                   df_xkf4.set_index('TimeUS'), 
+                                   df_rcou.set_index('TimeUS')], axis=1)
+            
+            df_merged = df_merged.sort_values(by='TimeUS')
+            
+            # Step 1 Addition: dropna() after ffill(), apply normalized Time_Since_Fault
+            df_merged = df_merged.ffill().dropna()
+            
+            df_merged = df_merged.reset_index()
+            df_merged['Time_Since_Fault'] = (df_merged['TimeUS'] - fault_time_us) / 1e6
+            
+            return df_merged
+
         except Exception as e:
-            print(f"[LOG] Parse error: {e}")
-            return self._empty_result(str(e))
+            raise ValueError(f"Failed to merge dataframes: {e}") from e
 
-        metrics = self._compute_metrics()
-        mode_changes = self._extract_mode_changes()
-        errors = self._extract_errors()
-
-        print(f"[LOG] Analysis complete — "
-              f"{sum(len(v.get(list(v.keys())[0] if v else '', [])) for v in self.data.values() if v)} "
-              f"data points across {len(self.data)} message types")
-
-        return {
-            "data":         self.data,
-            "metrics":      metrics,
-            "mode_changes": mode_changes,
-            "errors":       errors,
-            "success":      True,
-        }
-
-    # ── Parse ────────────────────────────────────────────────────
-
-    def _parse(self):
-        mu = _try_import_dfr()
-        if mu is None:
-            raise ImportError("pymavlink not available")
-
-        mlog = mu.mavlink_connection(self.log_path)
-        deadline = time.time() + self.timeout
-
-        for msg_type, fields in self.WANTED.items():
-            self.data[msg_type] = {f: [] for f in fields}
-
-        count = 0
-        while time.time() < deadline:
-            msg = mlog.recv_msg()
-            if msg is None:
-                break
-            mt = msg.get_type()
-            if mt in self.data:
-                for f in self.WANTED[mt]:
-                    try:
-                        self.data[mt][f].append(getattr(msg, f))
-                    except AttributeError:
-                        self.data[mt][f].append(None)
-            count += 1
-
-        self._parsed = True
-        print(f"[LOG] Parsed {count} messages")
-
-    # ── Metric computation ───────────────────────────────────────
-
-    def _compute_metrics(self) -> dict:
-        metrics = {}
-
-        # EKF velocity variance (from XKF4 or NKF4)
-        ekf4 = self.data.get("XKF4") or self.data.get("NKF4") or {}
-        sv = ekf4.get("SV", [])
-        if sv:
-            valid = [v for v in sv if v is not None]
-            if valid:
-                metrics["ekf_vel_var_mean"] = sum(valid) / len(valid)
-                metrics["ekf_vel_var_max"]  = max(valid)
-
-        sp = ekf4.get("SP", [])
-        if sp:
-            valid = [v for v in sp if v is not None]
-            if valid:
-                metrics["ekf_pos_var_mean"] = sum(valid) / len(valid)
-                metrics["ekf_pos_var_max"]  = max(valid)
-
-        # Attitude error (from ATT)
-        att = self.data.get("ATT", {})
-        if att.get("Roll") and att.get("DesRoll"):
-            roll_err = [abs((r or 0) - (d or 0))
-                        for r, d in zip(att["Roll"], att["DesRoll"])]
-            if roll_err:
-                metrics["roll_err_mean"] = sum(roll_err) / len(roll_err)
-                metrics["roll_err_max"]  = max(roll_err)
-
-        if att.get("Pitch") and att.get("DesPitch"):
-            pitch_err = [abs((p or 0) - (d or 0))
-                         for p, d in zip(att["Pitch"], att["DesPitch"])]
-            if pitch_err:
-                metrics["pitch_err_mean"] = sum(pitch_err) / len(pitch_err)
-                metrics["pitch_err_max"]  = max(pitch_err)
-
-        # Vibration (from VIBE)
-        vibe = self.data.get("VIBE", {})
-        for axis in ("VibeX", "VibeY", "VibeZ"):
-            vals = [v for v in vibe.get(axis, []) if v is not None]
-            if vals:
-                metrics[f"vibe_{axis.lower()}_max"] = max(vals)
-
-        return metrics
-
-    def _extract_mode_changes(self) -> list:
-        mode_data = self.data.get("MODE", {})
-        times  = mode_data.get("TimeUS", [])
-        modes  = mode_data.get("Mode", [])
-        nums   = mode_data.get("ModeNum", [])
-        changes = []
-        for i in range(len(times)):
-            changes.append({
-                "time_us": times[i],
-                "mode":    modes[i] if i < len(modes) else None,
-                "mode_num": nums[i] if i < len(nums) else None,
-            })
-        return changes
-
-    def _extract_errors(self) -> list:
-        err_data = self.data.get("ERR", {})
-        times   = err_data.get("TimeUS", [])
-        subsys  = err_data.get("Subsys", [])
-        ecodes  = err_data.get("ECode", [])
-        errors = []
-        for i in range(len(times)):
-            errors.append({
-                "time_us": times[i],
-                "subsys":  subsys[i] if i < len(subsys) else None,
-                "ecode":   ecodes[i] if i < len(ecodes) else None,
-            })
-        return errors
-
-    # ── Helpers ──────────────────────────────────────────────────
-
-    @staticmethod
-    def _empty_result(reason: str) -> dict:
-        return {
-            "data":         {},
-            "metrics":      {},
-            "mode_changes": [],
-            "errors":       [],
-            "success":      False,
-            "reason":       reason,
-        }
